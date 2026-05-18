@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>The Backrooms - Endless Desolation</title>
+    <link rel="stylesheet" href="styles.css">
+    <!-- Three.js & Post-processing (RenderPass, ShaderPass, EffectComposer) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/mrdoob/three.js@r128/examples/js/postprocessing/EffectComposer.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/mrdoob/three.js@r128/examples/js/postprocessing/RenderPass.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/mrdoob/three.js@r128/examples/js/postprocessing/ShaderPass.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/mrdoob/three.js@r128/examples/js/shaders/CopyShader.js"></script>
+</head>
+<body>
+
+    <!-- メニュー画面 -->
+    <div id="menu">
+        <h1>THE BACKROOMS</h1>
+        <p>LEVEL 0</p>
+        <button id="start-btn">ENTER THE VOID</button>
+        <div class="controls-guide">Move: WASD / Touch Joystick<br>Look: Mouse / Touch Drag</div>
+    </div>
+
+    <!-- ゲーム画面UI -->
+    <div id="game-ui" class="hidden">
+        <button id="view-toggle">MODE: VHS</button>
+        <!-- モバイル用ジョイスティック -->
+        <div id="joystick-zone">
+            <div id="joystick-knob"></div>
+        </div>
+    </div>
+
+    <script>
+        // --- グローバルゲーム状態管理（拡張性のため） ---
+        const Game = {
+            scene: null, camera: null, renderer: null, composer: null,
+            currentLevel: null, entities: [], activeView: 'vhs', // 'vhs' or 'normal'
+            controls: { moveX: 0, moveZ: 0, lookX: 0, lookY: 0 },
+            player: { position: new THREE.Vector3(0, 1.5, 0), rotation: new THREE.Vector3() },
+            vhsPass: null
+        };
+
+        // --- VHS カスタムシェーダー (RenderPass用) ---
+        const VHSShader = {
+            uniforms: {
+                "tDiffuse": { value: null },
+                "uTime": { value: 0.0 },
+                "uRGBShift": { value: 0.003 }
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform sampler2D tDiffuse;
+                uniform float uTime;
+                uniform float uRGBShift;
+                varying vec2 vUv;
+
+                // 疑似ノイズ関数
+                float noise(vec2 p) {
+                    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+                }
+
+                void main() {
+                    vec2 uv = vUv;
+                    
+                    // スキャンライン効果
+                    float scanline = sin(uv.y * 800.0 + uTime * 10.0) * 0.04;
+                    
+                    // 色収差 (RGB Shift)
+                    vec4 cr = texture2D(tDiffuse, vec2(uv.x + uRGBShift, uv.y));
+                    vec4 cg = texture2D(tDiffuse, uv);
+                    vec4 cb = texture2D(tDiffuse, vec2(uv.x - uRGBShift, uv.y));
+                    
+                    vec4 color = vec4(cr.r, cg.g, cb.b, 1.0);
+                    color.rgb += noise(uv + uTime) * 0.08; // アナログノイズ
+                    color.rgb -= scanline;
+
+                    // 若干のセピア・VHS色調補正
+                    color.rgb *= vec3(0.95, 0.9, 0.75); 
+
+                    gl_FragColor = color;
+                }
+            `
+        };
+
+        // --- 初期化処理 ---
+        function init() {
+            // シーン・カメラ・レンダラー
+            Game.scene = new THREE.Scene();
+            Game.scene.background = new THREE.Color(0x0a0a05);
+            Game.scene.fog = new THREE.FogExp2(0x1a1a10, 0.12); // 超リアルな空気感（霧）
+
+            Game.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 30);
+            Game.camera.position.copy(Game.player.position);
+
+            Game.renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+            Game.renderer.setSize(window.innerWidth, window.innerHeight);
+            Game.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // モバイル軽量化
+            document.body.appendChild(Game.renderer.domElement);
+
+            // ポストプロセッシング (RenderでVHSを再現)
+            Game.composer = new THREE.EffectComposer(Game.renderer);
+            const renderPass = new THREE.RenderPass(Game.scene, Game.camera);
+            Game.composer.addPass(renderPass);
+
+            Game.vhsPass = new THREE.ShaderPass(VHSShader);
+            Game.composer.addPass(Game.vhsPass);
+
+            // ライト（環境光は極小、蛍光灯ベイクを目立たせるため）
+            const ambientLight = new THREE.AmbientLight(0x22221c);
+            Game.scene.add(ambientLight);
+
+            // イベントリスナー
+            setupControls();
+            window.addEventListener('resize', onWindowResize);
+
+            // UIインタラクション
+            document.getElementById('start-btn').addEventListener('click', startGame);
+            document.getElementById('view-toggle').addEventListener('click', toggleView);
+        }
+
+        function startGame() {
+            document.getElementById('menu').classList.add('hidden');
+            document.getElementById('game-ui').classList.remove('hidden');
+            
+            // ロック要請 (PC用)
+            if(!isMobile()) document.body.requestPointerLock();
+
+            // Level 0 の読み込みと生成開始
+            if (typeof Level0 !== 'undefined') {
+                Game.currentLevel = new Level0(Game.scene);
+            }
+            
+            animate();
+        }
+
+        function toggleView() {
+            if (Game.activeView === 'vhs') {
+                Game.activeView = 'normal';
+                Game.vhsPass.enabled = false;
+                document.getElementById('view-toggle').innerText = "MODE: EYE";
+            } else {
+                Game.activeView = 'vhs';
+                Game.vhsPass.enabled = true;
+                document.getElementById('view-toggle').innerText = "MODE: VHS";
+            }
+        }
+
+        // --- 簡易入力制御 (PC/モバイルハイブリッド) ---
+        function setupControls() {
+            // PC キーボード
+            const keys = { w: false, a: false, s: false, d: false };
+            window.addEventListener('keydown', (e) => { keys[e.key.toLowerCase()] = true; });
+            window.addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
+
+            // マウス移動
+            window.addEventListener('mousemove', (e) => {
+                if (document.pointerLockElement === document.body || isMobile()) {
+                    Game.player.rotation.y -= e.movementX * 0.002;
+                    Game.player.rotation.x -= e.movementY * 0.002;
+                    Game.player.rotation.x = Math.max(-Math.PI/2, Math.min(Math.PI/2, Game.player.rotation.x));
+                }
+            });
+
+            // モバイルタッチ視点移動
+            let touchStartX = 0, touchStartY = 0;
+            window.addEventListener('touchstart', (e) => {
+                if(e.touches[0].clientX > window.innerWidth / 2) {
+                    touchStartX = e.touches[0].clientX;
+                    touchStartY = e.touches[0].clientY;
+                }
+            }, {passive: true});
+
+            window.addEventListener('touchmove', (e) => {
+                for(let t of e.touches) {
+                    if(t.clientX > window.innerWidth / 2) {
+                        const dx = t.clientX - touchStartX;
+                        const dy = t.clientY - touchStartY;
+                        Game.player.rotation.y -= dx * 0.005;
+                        Game.player.rotation.x -= dy * 0.005;
+                        touchStartX = t.clientX;
+                        touchStartY = t.clientY;
+                    }
+                }
+            }, {passive: true});
+
+            // モバイルジョイスティック (左画面)
+            const joystick = document.getElementById('joystick-zone');
+            const knob = document.getElementById('joystick-knob');
+            let joyActive = false;
+
+            joystick.addEventListener('touchstart', (e) => { joyActive = true; }, {passive: true});
+            window.addEventListener('touchmove', (e) => {
+                if (!joyActive) return;
+                const rect = joystick.getBoundingClientRect();
+                const touch = Array.from(e.touches).find(t => t.clientX < window.innerWidth / 2);
+                if (!touch) return;
+
+                const centerX = rect.left + rect.width / 2;
+                const centerY = rect.top + rect.height / 2;
+                let dx = touch.clientX - centerX;
+                let dy = touch.clientY - centerY;
+                const dist = Math.min(Math.sqrt(dx*dx + dy*dy), 40);
+
+                const angle = Math.atan2(dy, dx);
+                knob.style.transform = `translate(${Math.cos(angle)*dist}px, ${Math.sin(angle)*dist}px)`;
+
+                Game.controls.moveX = (Math.cos(angle) * dist) / 40;
+                Game.controls.moveZ = (Math.sin(angle) * dist) / 40;
+            }, {passive: true});
+
+            window.addEventListener('touchend', () => {
+                joyActive = false;
+                knob.style.transform = 'translate(0px, 0px)';
+                Game.controls.moveX = 0;
+                Game.controls.moveZ = 0;
+            });
+
+            // フレームごとの移動計算更新
+            Game.updateMovement = function() {
+                let speed = 0.06;
+                let forward = new THREE.Vector3(0, 0, -1).applyQuaternion(Game.camera.quaternion);
+                let right = new THREE.Vector3(1, 0, 0).applyQuaternion(Game.camera.quaternion);
+                forward.y = 0; right.y = 0; forward.normalize(); right.normalize();
+
+                if (!isMobile()) {
+                    if (keys.w) Game.player.position.addScaledVector(forward, speed);
+                    if (keys.s) Game.player.position.addScaledVector(forward, -speed);
+                    if (keys.a) Game.player.position.addScaledVector(right, -speed);
+                    if (keys.d) Game.player.position.addScaledVector(right, speed);
+                } else {
+                    Game.player.position.addScaledVector(forward, -Game.controls.moveZ * speed);
+                    Game.player.position.addScaledVector(right, Game.controls.moveX * speed);
+                }
+            };
+        }
+
+        function isMobile() { return 'ontouchstart' in window; }
+        function onWindowResize() {
+            Game.camera.aspect = window.innerWidth / window.innerHeight;
+            Game.camera.updateProjectionMatrix();
+            Game.renderer.setSize(window.innerWidth, window.innerHeight);
+            Game.composer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- メインループ ---
+        let clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = clock.getElapsedTime();
+
+            Game.updateMovement();
+
+            // カメラの回転適用
+            Game.camera.rotation.set(0,0,0);
+            Game.camera.rotation.y = Game.player.rotation.y;
+            Game.camera.rotation.x = Game.player.rotation.x;
+            Game.camera.position.copy(Game.player.position);
+            // リアルな歩行揺れ (Head Bobbing)
+            if(Game.controls.moveX !== 0 || Game.controls.moveZ !== 0 || window.movementX) {
+                 Game.camera.position.y += Math.sin(time * 10) * 0.02;
+            }
+
+            // 無限生成・カリングロジックの呼び出し
+            if (Game.currentLevel) {
+                Game.currentLevel.update(Game.player.position);
+            }
+
+            // エンティティ群の更新（後から追加しやすいように配列を回す）
+            Game.entities.forEach(entity => { if(entity.update) entity.update(); });
+
+            // VHSシェーダーの駆動
+            if (Game.activeView === 'vhs') {
+                Game.vhsPass.uniforms.uTime.value = time;
+            }
+
+            Game.composer.render();
+        }
+
+        window.onload = init;
+    </script>
+</body>
+</html>
